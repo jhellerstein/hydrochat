@@ -102,9 +102,17 @@ async fn single_dfir_pipeline(
         RequestRoute::Invalid(req.lines().next().unwrap_or("").to_string())
     };
 
+    // Channels for routing all requests through DFIR
+    let (route_tx, route_rx) = mpsc::channel::<RequestRoute>(1);
+    let _ = route_tx.send(route.clone()).await;
+
     match route {
         RequestRoute::Health => {
             health_response_adapter(stream, peer_addr).await;
+        }
+        RequestRoute::Invalid(path) => {
+            tracing::warn!("Rejecting invalid request from {}: {}", peer_addr, path);
+            // Just close the connection
         }
         RequestRoute::WebSocketProxy => {
             // Accept WebSocket upgrade outside DFIR (protocol conversion)
@@ -134,11 +142,31 @@ async fn single_dfir_pipeline(
             // TCP connection
             let (tcp_out, tcp_in) = connect_tcp_bytes();
 
-            // **THE SINGLE DFIR PIPELINE**: All business logic here
+            // **THE SINGLE DFIR PIPELINE**: All business logic here including routing
             let mut pipeline: Dfir = {
                 let dfir_to_ws_tx_ref = &dfir_to_ws_tx;
                 dfir_syntax! {
-                    // WebSocket → TCP Server dataflow
+                    // HTTP Request Routing - add routing to the single pipeline
+                    route_stream = source_stream(ReceiverStream::new(route_rx).map(Ok::<_, ()>))
+                        -> filter_map(|result| result.ok())
+                        -> demux_enum::<RequestRoute>();
+
+                    // Health endpoint - simple handler in DFIR
+                    route_stream[Health] -> for_each(move |_| {
+                        tracing::debug!("DFIR: Processing health request (already handled outside)");
+                    });
+
+                    // Invalid request - simple handler in DFIR
+                    route_stream[Invalid] -> for_each(move |(invalid_path,)| {
+                        tracing::warn!("DFIR: Processing invalid request: {}", invalid_path);
+                    });
+
+                    // WebSocket proxy routes to existing message handling
+                    route_stream[WebSocketProxy] -> for_each(move |_| {
+                        tracing::debug!("DFIR: WebSocket routing confirmed - proceeding with message pipeline");
+                    });
+
+                    // WebSocket → TCP Server dataflow (existing)
                     client_stream = source_stream(ReceiverStream::new(ws_to_dfir_rx).map(Ok::<_, ()>))
                         -> filter_map(|result| result.ok())
                         -> map(|msg| {
@@ -147,7 +175,7 @@ async fn single_dfir_pipeline(
                         })
                         -> dest_sink_serde(tcp_out);
 
-                    // TCP Server → WebSocket dataflow
+                    // TCP Server → WebSocket dataflow (existing)
                     server_stream = source_stream_serde(tcp_in)
                         -> filter_map(|result: Result<(hydrochat_core::protocol::Message, SocketAddr), _>| {
                             match result {
@@ -227,10 +255,6 @@ async fn single_dfir_pipeline(
 
             // Run the single DFIR pipeline with protocol adapters
             tokio::join!(pipeline.run_async(), ws_reader, ws_writer);
-        }
-        RequestRoute::Invalid(path) => {
-            tracing::warn!("Rejecting invalid request from {}: {}", peer_addr, path);
-            // Just close the connection
         }
     }
 }

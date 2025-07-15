@@ -1,0 +1,16 @@
+{
+  "name": "hydrochat-electron",
+  "version": "1.0.0",
+  "description": "Hydro Chat Electron Client",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "echo 'Build the Rust WASM first with: cargo build --target wasm32-unknown-unknown'"
+  },
+  "devDependencies": {
+    "electron": "^28.0.0"
+  },
+  "keywords": ["hydro", "chat", "electron", "wasm"],
+  "author": "Hydro Project",
+  "license": "MIT"
+} 

@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "hydrochat-core",
+    "hydrochat-server",
+    "hydrochat-wasm",
+    "hydrochat-proxy"
+]

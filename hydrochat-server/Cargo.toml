@@ -1,0 +1,19 @@
+[package]
+name = "hydrochat-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hydrochat-core = { path = "../hydrochat-core", features = ["dfir"] }
+hydro_proxy = { path = "../../hydro/hydro_proxy" }
+dfir_rs = { path = "../../hydro/dfir_rs" }
+dfir_macro = { path = "../../hydro/dfir_macro" }
+dfir_lang = { path = "../../hydro/dfir_lang" }
+tokio = { version = "1.0", features = ["full"] }
+warp = "0.3"
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+bincode = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+futures-util = "0.3"

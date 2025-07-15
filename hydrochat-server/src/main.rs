@@ -23,45 +23,34 @@ pub async fn run_server(address: SocketAddr) -> anyhow::Result<()> {
     let mut hf: Dfir = dfir_syntax! {
         // Define shared inbound and outbound channels
         outbound_chan = union() -> dest_sink_serde(outbound);
-        inbound_chan = source_stream(inbound)
-    -> filter_map(|res| {
-        match res {
-            Ok((bytes, addr)) => {
-                if bytes.len() < 4 {
-                    eprintln!("Received message too short for length prefix: {:?}", bytes);
-                    None
-                } else {
-                    let msg_bytes = &bytes[4..];
-                    match bincode::deserialize::<Message>(msg_bytes) {
-                        Ok(msg) => {
-                            Some((msg, addr))
-                        }
-                        Err(e) => {
-                            eprintln!("Deserialization error: {:?}", e);
-                            None
-                        }
+        inbound_chan = source_stream_serde(inbound)
+            -> filter_map(|result| {
+                match result {
+                    Ok((msg, addr)) => {
+                        eprintln!("SERVER received message from {}: {:?}", addr, msg);
+                        Some(MessageWithAddr::from_message(msg, addr))
+                    }
+                    Err(e) => {
+                        eprintln!("SERVER serde deserialization error: {:?}", e);
+                        None
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("[LOG] Error in stream: {:?}", e);
-                None
-            }
-        }
-    })
-    -> map(|(msg, addr)| {
-        let msg_with_addr = MessageWithAddr::from_message(msg, addr);
-        msg_with_addr
-    })
-    -> demux_enum::<MessageWithAddr>();
+            })
+            -> demux_enum::<MessageWithAddr>();
         clients = inbound_chan[ConnectRequest]
-            -> map(|(addr,)| addr)
+            -> map(|(addr,)| {
+                eprintln!("SERVER processing ConnectRequest from {}", addr);
+                addr
+            })
             -> tee();
         inbound_chan[ConnectResponse] -> for_each(|(addr,)| println!("Received unexpected `ConnectResponse` as server from addr {}.", addr));
 
         // Pipeline 1: Acknowledge client connections
         clients[0]
-            -> map(|addr| (Message::ConnectResponse, addr))
+            -> map(|addr| {
+                eprintln!("SERVER sending ConnectResponse to {}", addr);
+                (Message::ConnectResponse, addr)
+            })
             -> [0]outbound_chan;
 
         // Pipeline 2: Broadcast messages to all clients

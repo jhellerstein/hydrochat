@@ -1,18 +1,17 @@
 //! HydroChat WebSocket <-> DFIR TCP Proxy
 //!
-//! This proxy achieves a single DFIR pipeline architecture:
-//! - **Single DFIR Pipeline**: One `dfir_syntax!` block handles WebSocket-TCP proxying
-//! - **Simple HTTP Routing**: Basic request parsing outside DFIR (health/proxy/invalid)
-//! - **All Message Logic in DFIR**: WebSocket ↔ TCP message proxying, serialization, error handling
-//! - **Minimal Protocol Adapters**: Only HTTP responses and WebSocket upgrades outside DFIR
+//! This proxy achieves a clean DFIR pipeline architecture:
+//! - **Single DFIR Pipeline**: One `dfir_syntax!` block handles WebSocket ↔ TCP message proxying and protocol conversion
+//! - **Simple HTTP Routing**: Basic request parsing outside DFIR for simple request-response patterns (health/invalid)
+//! - **Complex Message Logic in DFIR**: WebSocket protocol adapters, TCP communication, and message proxying in DFIR
+//! - **Minimal External Logic**: Only simple HTTP responses and WebSocket upgrades outside DFIR
 //!
 //! Architecture Flow:
 //! 1. `handle_incoming` - HTTP request peek and basic routing decision
-//! 2. `single_dfir_pipeline` - Route to health/proxy/invalid endpoints
-//! 3. For WebSocket proxy: **One DFIR pipeline** handles all message proxying
-//! 4. Protocol adapters - HTTP responses and WebSocket protocol conversion
+//! 2. `single_dfir_pipeline` - Simple cases (health/invalid) handled outside DFIR
+//! 3. For WebSocket proxy: **One DFIR pipeline** handles protocol conversion and message proxying
+//! 4. Minimal external tasks - HTTP responses, WebSocket upgrade, and raw frame transport
 
-use dfir_rs::bytes::Bytes;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -74,12 +73,12 @@ async fn handle_incoming(stream: TcpStream, peer_addr: SocketAddr, server_addr: 
     single_dfir_pipeline(request_data, stream, peer_addr, server_addr).await;
 }
 
-/// This single dataflow handles:
-/// - HTTP request parsing and routing
-/// - Health endpoint responses
-/// - WebSocket upgrade and proxying
+/// This function handles:
+/// - HTTP request parsing and simple routing (health/invalid handled outside DFIR)
+/// - WebSocket upgrade and protocol negotiation
+/// - For WebSocket proxy: DFIR pipeline handles all message processing and protocol conversion
 /// - TCP communication with server
-/// - All error handling and protocol conversion
+/// - All WebSocket ↔ HydroChat message conversion in DFIR
 async fn single_dfir_pipeline(
     request_data: Vec<u8>,
     stream: TcpStream,
@@ -92,171 +91,221 @@ async fn single_dfir_pipeline(
     use futures_util::{SinkExt, StreamExt};
     use tokio_stream::wrappers::ReceiverStream;
 
-    // Parse the HTTP request to determine routing
-    let req = String::from_utf8_lossy(&request_data);
-    let route = if req.contains("GET /health") {
-        RequestRoute::Health
-    } else if req.contains("GET /proxy") {
-        RequestRoute::WebSocketProxy
-    } else {
-        RequestRoute::Invalid(req.lines().next().unwrap_or("").to_string())
-    };
+    // Channels for HTTP request data and actions
+    let (http_request_tx, http_request_rx) = mpsc::channel::<Vec<u8>>(1);
+    let (action_tx, mut action_rx) = mpsc::channel::<RequestAction>(1);
 
-    // Channels for routing all requests through DFIR
-    let (route_tx, route_rx) = mpsc::channel::<RequestRoute>(1);
-    let _ = route_tx.send(route.clone()).await;
+    // Send raw HTTP request data to DFIR for parsing and routing
+    let _ = http_request_tx.send(request_data).await;
 
-    match route {
-        RequestRoute::Health => {
-            health_response_adapter(stream, peer_addr).await;
-        }
-        RequestRoute::Invalid(path) => {
-            tracing::warn!("Rejecting invalid request from {}: {}", peer_addr, path);
-            // Just close the connection
-        }
-        RequestRoute::WebSocketProxy => {
-            // Accept WebSocket upgrade outside DFIR (protocol conversion)
-            let ws_stream = match accept_hdr_async(stream, |req: &Request, mut resp: Response| {
-                if let Some(protocols) = req.headers().get("Sec-WebSocket-Protocol") {
-                    resp.headers_mut()
-                        .insert("Sec-WebSocket-Protocol", protocols.clone());
-                }
-                Ok(resp)
-            })
-            .await
-            {
-                Ok(ws) => ws,
-                Err(e) => {
-                    tracing::error!("WebSocket upgrade failed from {}: {}", peer_addr, e);
-                    return;
-                }
-            };
+    // Channels for WebSocket frames (in case we need WebSocket proxy)
+    let (ws_frame_to_dfir_tx, ws_frame_to_dfir_rx) =
+        mpsc::channel::<tokio_tungstenite::tungstenite::Message>(16);
+    let (dfir_to_ws_frame_tx, mut dfir_to_ws_frame_rx) =
+        mpsc::channel::<tokio_tungstenite::tungstenite::Message>(16);
 
-            let (mut ws_tx, mut ws_rx) = ws_stream.split();
+    // TCP connection (in case we need WebSocket proxy)
+    let (tcp_out, tcp_in) = connect_tcp_bytes();
 
-            // Channels for protocol conversion
-            let (ws_to_dfir_tx, ws_to_dfir_rx) =
-                mpsc::channel::<hydrochat_core::protocol::Message>(16);
-            let (dfir_to_ws_tx, mut dfir_to_ws_rx) = mpsc::channel::<Bytes>(16);
+    // **THE SINGLE DFIR PIPELINE**: HTTP routing AND WebSocket message processing
+    let mut pipeline: Dfir = {
+        let action_tx_ref = &action_tx;
+        let dfir_to_ws_frame_tx_ref = &dfir_to_ws_frame_tx;
+        let peer_addr_copy = peer_addr;
 
-            // TCP connection
-            let (tcp_out, tcp_in) = connect_tcp_bytes();
+        dfir_syntax! {
+            // HTTP Request Parsing and Routing (moved into DFIR)
+            http_requests = source_stream(ReceiverStream::new(http_request_rx).map(Ok::<_, ()>))
+                -> filter_map(|result| result.ok())
+                -> map(|request_data| {
+                    let req = String::from_utf8_lossy(&request_data);
+                    if req.contains("GET /health") {
+                        RequestRoute::Health
+                    } else if req.contains("GET /proxy") {
+                        RequestRoute::WebSocketProxy
+                    } else {
+                        RequestRoute::Invalid(req.lines().next().unwrap_or("").to_string())
+                    }
+                })
+                -> demux_enum::<RequestRoute>();
 
-            // **THE SINGLE DFIR PIPELINE**: All business logic here including routing
-            let mut pipeline: Dfir = {
-                let dfir_to_ws_tx_ref = &dfir_to_ws_tx;
-                dfir_syntax! {
-                    // HTTP Request Routing - add routing to the single pipeline
-                    route_stream = source_stream(ReceiverStream::new(route_rx).map(Ok::<_, ()>))
-                        -> filter_map(|result| result.ok())
-                        -> demux_enum::<RequestRoute>();
+            // Health endpoint - simple handler in DFIR
+            http_requests[Health] -> for_each(move |_| {
+                tracing::debug!("DFIR: Processing health request");
+                let _ = action_tx_ref.try_send(RequestAction::SendHealthResponse);
+            });
 
-                    // Health endpoint - simple handler in DFIR
-                    route_stream[Health] -> for_each(move |_| {
-                        tracing::debug!("DFIR: Processing health request (already handled outside)");
-                    });
+            // Invalid request - simple handler in DFIR
+            http_requests[Invalid] -> for_each(move |(invalid_path,)| {
+                tracing::warn!("DFIR: Rejecting invalid request from {}: {}", peer_addr_copy, invalid_path);
+                let _ = action_tx_ref.try_send(RequestAction::CloseConnection);
+            });
 
-                    // Invalid request - simple handler in DFIR
-                    route_stream[Invalid] -> for_each(move |(invalid_path,)| {
-                        tracing::warn!("DFIR: Processing invalid request: {}", invalid_path);
-                    });
+            // WebSocket proxy - upgrade and start message pipeline in DFIR
+            http_requests[WebSocketProxy] -> for_each(move |_| {
+                tracing::debug!("DFIR: Processing WebSocket upgrade request");
+                let _ = action_tx_ref.try_send(RequestAction::StartWebSocketProxy);
+            });
 
-                    // WebSocket proxy routes to existing message handling
-                    route_stream[WebSocketProxy] -> for_each(move |_| {
-                        tracing::debug!("DFIR: WebSocket routing confirmed - proceeding with message pipeline");
-                    });
-
-                    // WebSocket → TCP Server dataflow (existing)
-                    client_stream = source_stream(ReceiverStream::new(ws_to_dfir_rx).map(Ok::<_, ()>))
-                        -> filter_map(|result| result.ok())
-                        -> map(|msg| {
-                            tracing::debug!("DFIR: processing outbound message: {:?}", msg);
-                            (msg, server_addr)
-                        })
-                        -> dest_sink_serde(tcp_out);
-
-                    // TCP Server → WebSocket dataflow (existing)
-                    server_stream = source_stream_serde(tcp_in)
-                        -> filter_map(|result: Result<(hydrochat_core::protocol::Message, SocketAddr), _>| {
-                            match result {
-                                Ok((message, addr)) => {
-                                    tracing::debug!("DFIR: received from server {}: {:?}", addr, message);
+            // WebSocket Frame → HydroChat Message → TCP Server (protocol adapter in DFIR)
+            ws_incoming = source_stream(ReceiverStream::new(ws_frame_to_dfir_rx).map(Ok::<_, ()>))
+                -> filter_map(|result| result.ok())
+                -> filter_map(|ws_msg| {
+                    match ws_msg {
+                        tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                            match bincode::deserialize::<hydrochat_core::protocol::Message>(&data) {
+                                Ok(message) => {
+                                    tracing::debug!("DFIR: WebSocket binary → HydroChat message: {:?}", message);
                                     Some(message)
                                 }
                                 Err(e) => {
-                                    tracing::error!("DFIR: serde error: {}", e);
+                                    tracing::error!("DFIR: WebSocket binary deserialization failed: {}", e);
                                     None
-                                }
-                            }
-                        })
-                        -> filter_map(move |message| {
-                            tracing::debug!("DFIR: routing to client {}: {:?}", peer_addr, message);
-                            match bincode::serialize(&message) {
-                                Ok(bytes) => {
-                                    tracing::debug!("DFIR: serialized {} bytes for WebSocket", bytes.len());
-                                    Some(Bytes::from(bytes))
-                                }
-                                Err(e) => {
-                                    tracing::error!("DFIR: WebSocket serialization failed: {}", e);
-                                    None
-                                }
-                            }
-                        })
-                        -> for_each(move |serialized_bytes| {
-                            let _ = dfir_to_ws_tx_ref.try_send(serialized_bytes);
-                        });
-                }
-            };
-
-            // Protocol adapters (minimal conversion only)
-            let ws_reader = async {
-                while let Some(Ok(msg)) = ws_rx.next().await {
-                    match msg {
-                        tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                            if let Ok(message) =
-                                bincode::deserialize::<hydrochat_core::protocol::Message>(&data)
-                            {
-                                if ws_to_dfir_tx.send(message).await.is_err() {
-                                    break;
                                 }
                             }
                         }
                         tokio_tungstenite::tungstenite::Message::Text(text) => {
                             let data = text.into_bytes();
-                            if let Ok(message) =
-                                bincode::deserialize::<hydrochat_core::protocol::Message>(&data)
-                            {
-                                if ws_to_dfir_tx.send(message).await.is_err() {
-                                    break;
+                            match bincode::deserialize::<hydrochat_core::protocol::Message>(&data) {
+                                Ok(message) => {
+                                    tracing::debug!("DFIR: WebSocket text → HydroChat message: {:?}", message);
+                                    Some(message)
+                                }
+                                Err(e) => {
+                                    tracing::error!("DFIR: WebSocket text deserialization failed: {}", e);
+                                    None
                                 }
                             }
                         }
                         tokio_tungstenite::tungstenite::Message::Close(_) => {
-                            break;
+                            tracing::debug!("DFIR: WebSocket close frame received");
+                            None
                         }
-                        _ => {} // Ignore ping/pong
+                        _ => {
+                            tracing::trace!("DFIR: Ignoring WebSocket ping/pong");
+                            None
+                        }
                     }
-                }
-            };
+                })
+                -> map(|msg| {
+                    tracing::debug!("DFIR: Sending HydroChat message to TCP server: {:?}", msg);
+                    (msg, server_addr)
+                })
+                -> dest_sink_serde(tcp_out);
 
-            let ws_writer = async {
-                while let Some(serialized_bytes) = dfir_to_ws_rx.recv().await {
-                    if ws_tx
-                        .send(tokio_tungstenite::tungstenite::Message::Binary(
-                            serialized_bytes.to_vec(),
-                        ))
-                        .await
-                        .is_err()
-                    {
+            // TCP Server → HydroChat Message → WebSocket Frame (protocol adapter in DFIR)
+            server_stream = source_stream_serde(tcp_in)
+                -> filter_map(|result: Result<(hydrochat_core::protocol::Message, SocketAddr), _>| {
+                    match result {
+                        Ok((message, addr)) => {
+                            tracing::debug!("DFIR: TCP server {} → HydroChat message: {:?}", addr, message);
+                            Some(message)
+                        }
+                        Err(e) => {
+                            tracing::error!("DFIR: TCP serde error: {}", e);
+                            None
+                        }
+                    }
+                })
+                -> filter_map(move |message| {
+                    tracing::debug!("DFIR: HydroChat message → WebSocket frame for {}: {:?}", peer_addr, message);
+                    match bincode::serialize(&message) {
+                        Ok(bytes) => {
+                            tracing::debug!("DFIR: Serialized {} bytes for WebSocket", bytes.len());
+                            let ws_msg = tokio_tungstenite::tungstenite::Message::Binary(bytes);
+                            Some(ws_msg)
+                        }
+                        Err(e) => {
+                            tracing::error!("DFIR: WebSocket frame serialization failed: {}", e);
+                            None
+                        }
+                    }
+                })
+                -> for_each(move |ws_frame| {
+                    let _ = dfir_to_ws_frame_tx_ref.try_send(ws_frame);
+                });
+        }
+    };
+
+    // Run DFIR pipeline and handle actions concurrently
+    let dfir_future = pipeline.run_async();
+
+    tokio::pin!(dfir_future);
+
+    loop {
+        tokio::select! {
+            _ = &mut dfir_future => {
+                tracing::debug!("DFIR pipeline completed");
+                break;
+            },
+            action = action_rx.recv() => {
+                match action {
+                    Some(RequestAction::SendHealthResponse) => {
+                        health_response_adapter(stream, peer_addr).await;
                         break;
                     }
-                }
-            };
+                    Some(RequestAction::CloseConnection) => {
+                        // Just close the connection
+                        break;
+                    }
+                    Some(RequestAction::StartWebSocketProxy) => {
+                        // Accept WebSocket upgrade
+                        let ws_stream = match accept_hdr_async(stream, |req: &Request, mut resp: Response| {
+                            if let Some(protocols) = req.headers().get("Sec-WebSocket-Protocol") {
+                                resp.headers_mut()
+                                    .insert("Sec-WebSocket-Protocol", protocols.clone());
+                            }
+                            Ok(resp)
+                        })
+                        .await
+                        {
+                            Ok(ws) => ws,
+                            Err(e) => {
+                                tracing::error!("WebSocket upgrade failed from {}: {}", peer_addr, e);
+                                return;
+                            }
+                        };
 
-            // Run the single DFIR pipeline with protocol adapters
-            tokio::join!(pipeline.run_async(), ws_reader, ws_writer);
+                        let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+                        // Start WebSocket I/O tasks concurrently with the DFIR pipeline
+                        let ws_reader_task = async {
+                            while let Some(Ok(msg)) = ws_rx.next().await {
+                                if ws_frame_to_dfir_tx.send(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                        };
+
+                        let ws_writer_task = async {
+                            while let Some(ws_frame) = dfir_to_ws_frame_rx.recv().await {
+                                if ws_tx.send(ws_frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                        };
+
+                        // Run WebSocket I/O tasks concurrently with the DFIR pipeline
+                        tokio::select! {
+                            _ = &mut dfir_future => {},
+                            _ = ws_reader_task => {},
+                            _ = ws_writer_task => {},
+                        }
+                        break;
+                    }
+                    None => break,
+                }
+            }
         }
     }
+}
+
+/// Actions that the DFIR HTTP routing pipeline can emit
+#[derive(Debug, Clone)]
+enum RequestAction {
+    SendHealthResponse,
+    CloseConnection,
+    StartWebSocketProxy,
 }
 
 /// **Protocol Handlers**: Pure protocol conversion based on DFIR routing decisions  

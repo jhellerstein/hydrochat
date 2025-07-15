@@ -1,15 +1,15 @@
 //! HydroChat WebSocket <-> DFIR TCP Proxy
 //!
 //! This proxy achieves a clean DFIR pipeline architecture:
-//! - **Single DFIR Pipeline**: One `dfir_syntax!` block handles WebSocket ↔ TCP message proxying and protocol conversion
-//! - **Simple HTTP Routing**: Basic request parsing outside DFIR for simple request-response patterns (health/invalid)
+//! - **Single DFIR Pipeline**: One `dfir_syntax!` block handles HTTP routing, WebSocket ↔ TCP message proxying and protocol conversion
+//! - **Streamlined Connection Handling**: Centralized connection management with DFIR pipeline
 //! - **Complex Message Logic in DFIR**: WebSocket protocol adapters, TCP communication, and message proxying in DFIR
 //! - **Minimal External Logic**: Only simple HTTP responses and WebSocket upgrades outside DFIR
 //!
 //! Architecture Flow:
-//! 1. `handle_incoming` - HTTP request peek and basic routing decision
-//! 2. `single_dfir_pipeline` - Simple cases (health/invalid) handled outside DFIR
-//! 3. For WebSocket proxy: **One DFIR pipeline** handles protocol conversion and message proxying
+//! 1. Centralized connection acceptor spawns connection handlers
+//! 2. Each connection runs through **One DFIR pipeline** for HTTP parsing and routing
+//! 3. For WebSocket proxy: DFIR pipeline handles protocol conversion and message proxying
 //! 4. Minimal external tasks - HTTP responses, WebSocket upgrade, and raw frame transport
 
 use std::net::SocketAddr;
@@ -31,12 +31,22 @@ async fn main() -> anyhow::Result<()> {
         server_addr
     );
 
-    // Use LocalSet because DFIR types are !Send (cannot be sent between threads)
+    // Run the proxy server
+    run_proxy_server(ws_addr, server_addr).await;
+
+    Ok(())
+}
+
+/// Run the proxy server with centralized connection handling
+async fn run_proxy_server(ws_addr: &str, server_addr: SocketAddr) {
+    // Create TCP listener
+    let listener = TcpListener::bind(ws_addr).await.unwrap();
+    tracing::info!("Proxy server listening on {}", ws_addr);
+
+    // Use LocalSet for DFIR compatibility
     let local = LocalSet::new();
     local
         .run_until(async move {
-            // Combined server for health and WebSocket endpoints
-            let listener = TcpListener::bind(ws_addr).await.unwrap();
             loop {
                 let (stream, addr) = listener.accept().await.unwrap();
                 // Handle each connection with spawn_local (for !Send futures)
@@ -44,8 +54,6 @@ async fn main() -> anyhow::Result<()> {
             }
         })
         .await;
-
-    Ok(())
 }
 
 /// **Request Router**: Determines request type and delegates to appropriate handler
@@ -85,8 +93,12 @@ async fn single_dfir_pipeline(
     peer_addr: SocketAddr,
     server_addr: SocketAddr,
 ) {
-    tracing::debug!("single_dfir_pipeline: Starting for peer {}, data len: {}", peer_addr, request_data.len());
-    
+    tracing::debug!(
+        "single_dfir_pipeline: Starting for peer {}, data len: {}",
+        peer_addr,
+        request_data.len()
+    );
+
     use dfir_rs::dfir_syntax;
     use dfir_rs::scheduled::graph::Dfir;
     use dfir_rs::util::connect_tcp_bytes;
@@ -337,24 +349,41 @@ async fn health_response_adapter(mut stream: TcpStream, peer_addr: SocketAddr) {
             e
         );
     } else {
-        tracing::debug!("Health response adapter: Successfully sent response to {}", peer_addr);
+        tracing::debug!(
+            "Health response adapter: Successfully sent response to {}",
+            peer_addr
+        );
     }
-    
+
     // Flush the write buffer
     if let Err(e) = stream.flush().await {
-        tracing::debug!("Health response adapter: Error flushing stream to {}: {}", peer_addr, e);
+        tracing::debug!(
+            "Health response adapter: Error flushing stream to {}: {}",
+            peer_addr,
+            e
+        );
     } else {
-        tracing::debug!("Health response adapter: Successfully flushed stream to {}", peer_addr);
+        tracing::debug!(
+            "Health response adapter: Successfully flushed stream to {}",
+            peer_addr
+        );
     }
 
     // Give the client time to read before shutting down
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    
+
     // Shutdown the write side
     if let Err(e) = stream.shutdown().await {
-        tracing::debug!("Health response adapter: Error shutting down stream to {}: {}", peer_addr, e);
+        tracing::debug!(
+            "Health response adapter: Error shutting down stream to {}: {}",
+            peer_addr,
+            e
+        );
     } else {
-        tracing::debug!("Health response adapter: Successfully shutdown stream to {}", peer_addr);
+        tracing::debug!(
+            "Health response adapter: Successfully shutdown stream to {}",
+            peer_addr
+        );
     }
 }
 
@@ -481,19 +510,22 @@ mod tests {
 
             // Read response
             let mut buf = [0u8; 1024];
-            let bytes_read = timeout(
-                Duration::from_millis(1000),
-                stream.read(&mut buf),
-            )
-            .await
-            .expect("Should read response within timeout")
-            .expect("Should read successfully");
-            
+            let bytes_read = timeout(Duration::from_millis(1000), stream.read(&mut buf))
+                .await
+                .expect("Should read response within timeout")
+                .expect("Should read successfully");
+
             let response_str = String::from_utf8_lossy(&buf[..bytes_read]);
-            
+
             // Check if we got the expected response
-            assert!(!response_str.is_empty(), "Should receive some response data");
-            assert!(response_str.contains("200 OK"), "Should contain 200 OK status");
+            assert!(
+                !response_str.is_empty(),
+                "Should receive some response data"
+            );
+            assert!(
+                response_str.contains("200 OK"),
+                "Should contain 200 OK status"
+            );
             assert!(response_str.contains("OK"), "Should contain OK in body");
         };
 

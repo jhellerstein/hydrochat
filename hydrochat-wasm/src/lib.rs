@@ -1,11 +1,8 @@
-use chrono::Utc;
 use hydrochat_core::{protocol::Message as ChatMessage, ChatClient};
 use js_sys::{Array, Uint8Array};
-use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
 thread_local! {
